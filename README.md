@@ -1,197 +1,204 @@
-# HubSpot → Monday.com Migration Engine
+# HubSpot → Monday Migration Engine
 
-A Python-based one-time data migration engine designed to transfer structured CRM data from HubSpot to Monday.com.
-
-This tool focuses on reliability, strict validation, and controlled concurrency. It is **not** a real-time integration or bi-directional sync system.
+Stateful CRM migration execution engine for moving HubSpot REST records into Monday GraphQL boards with resumable progression, bounded concurrency, and strict mapping integrity.
 
 ---
 
-## 📌 Project Overview
+## Executive Summary
 
-This project migrates large datasets (10k–20k+ records) from HubSpot CRM (v3 REST API) to Monday.com (GraphQL API).
+This repository implements a restart-safe migration pipeline for API-to-API CRM transfer. It is designed for operational migration runs, not ad hoc export scripts.
 
-It was built to handle:
-- Large record volumes
-- Strict column mapping requirements
-- Controlled parallel API execution
-- Resume capability after interruption
-- Fail-fast validation to prevent silent data loss
+The engine advances incrementally through HubSpot cursor pagination, transforms source objects into Monday column payloads, executes bounded parallel load operations, and persists progress checkpoints to support deterministic recovery.
 
-The system follows a modular architecture separating data fetching, transformation, mutation, and orchestration logic.
+## Business Problem
 
----
+CRM re-platforming from HubSpot to Monday introduces high operational risk:
 
-## 🎯 Problem Statement
+- interrupted long-running migrations
+- API throughput constraints and rate pressure
+- source/target schema mismatch
+- manual replay overhead after failures
+- silent data-loss risk from weak validation
 
-Migrating CRM data between platforms introduces challenges such as:
-- Cursor-based pagination handling
-- API rate limits and complexity budgets
-- Data type mismatches (e.g., timestamps → date columns)
-- Strict column mapping validation
-- Safe recovery after unexpected interruption
+## Why This System Exists
 
-This engine addresses those challenges with explicit architectural decisions.
+This system exists to provide a controlled migration runtime with:
 
----
+- resumable progression across large datasets
+- explicit schema mapping control
+- deterministic batch advancement
+- fail-fast integrity behavior over silent partial success
+- operationally simple execution model for one-time or phased migrations
 
-## 🏗️ Architecture & Design Decisions
-
-### 1️⃣ Cursor-Based Pagination (HubSpot)
-HubSpot records are fetched using the `after` cursor mechanism to:
-- Safely iterate over large datasets
-- Avoid memory overload
-- Maintain deterministic processing order
-
-### 2️⃣ Modular Separation of Concerns
-The project is structured into clear layers:
-- **Clients Layer**
-  - `hubspot_client.py` – Handles HubSpot API authentication and fetching
-  - `monday_client.py` – Handles Monday GraphQL mutations
-- **Transformation Layer**
-  - `company_mapper.py` – Transforms HubSpot objects into Monday item structure
-- **Configuration Layer**
-  - Environment variables and column mapping definitions
-- **State Layer**
-  - Checkpoint persistence logic
-- **Orchestration Layer**
-  - `main.py` – Controls the fetch → transform → load workflow
-
-This design allows adding new object types without modifying the core engine.
-
-### 3️⃣ Controlled Concurrency
-The workload is I/O-bound (API-heavy). To improve throughput:
-- `ThreadPoolExecutor` is used for parallel mutation calls
-- Worker count is configurable
-- Execution remains bounded to respect Monday.com API limits
-
-Threading was selected for simplicity and sufficient performance at the target dataset size.
-
-### 4️⃣ Fail-Fast Validation
-The system enforces strict validation:
-- Missing column mappings raise immediate errors
-- Invalid mutation responses halt execution
-- No silent column skipping
-
-This ensures data integrity during migration.
-
-### 5️⃣ Date Normalization
-HubSpot ISO timestamps (e.g. `2026-02-16T09:55:32.363Z`) are converted into Monday.com's required Date column format:
-
-```json
-{ "date": "YYYY-MM-DD" }
-```
-
-### 6️⃣ Checkpoint Recovery
-A checkpoint file stores the last processed pagination cursor. If the script is interrupted:
-- It resumes from the last successful batch.
-- Previously processed records are not re-fetched.
-
-Checkpoint updates occur only after successful batch completion.
-
----
-
-## ✨ Core Features
-
-- Cursor-based pagination
-- Configurable page limits
-- Strict column mapping validation
-- Date formatting normalization
-- Controlled parallel execution
-- Resume-safe checkpoint system
-- Explicit error handling
-- Modular architecture
-
----
-
-## 📂 Project Structure
+## Architecture Overview
 
 ```text
-hubspot_monday_migration/
+Orchestrator (main.py)
+  -> Extractor (clients/hubspot_client.py)
+  -> Transformer (transformers/company_mapper.py)
+  -> Loader (clients/monday_client.py)
+  -> Checkpoint State (state/checkpoint.py + state/checkpoint.json)
+  -> Runtime Config (config/settings.py, config/*_columns.py)
+```
+
+## Engineering Highlights
+
+- Cursor-based incremental extraction
+- Restart-safe checkpoint recovery
+- Bounded worker pool for network-bound parallel loading
+- Mapping abstraction between source properties and target columns
+- Strict validation and explicit failure signaling
+- Transform layer isolation for field normalization
+
+## System Design Decisions
+
+| Decision | Rationale | Consequence |
+|---|---|---|
+| Cursor pagination | Bounded memory and deterministic progression | Single forward traversal model |
+| ThreadPoolExecutor (bounded) | Practical throughput for I/O-bound loads | Needs careful tuning for API limits |
+| Fail-fast load behavior | Protect migration integrity | Single bad record can halt run |
+| File-backed checkpoint state | Operational simplicity | Single-runner state model |
+| Separate transform layer | Isolated schema evolution | Additional code surface to maintain |
+
+## Data Flow
+
+1. Read runtime settings and last checkpoint cursor.
+2. Fetch one HubSpot page using `after` cursor + selected properties.
+3. Transform each record into Monday payload structure.
+4. Execute parallel load operations with bounded worker count.
+5. Persist next cursor only after successful batch completion.
+6. Repeat until no next cursor exists.
+
+## REST → GraphQL Migration Flow
+
+- **Source:** HubSpot CRM v3 REST objects (`/crm/v3/objects/companies`)
+- **Target:** Monday GraphQL `create_item` mutation
+- **Translation:** source properties -> normalized transform -> mapped Monday column IDs
+- **Type handling:** date normalization and URL column payload shaping
+
+## Checkpoint Recovery
+
+- Checkpoint stores latest successful `after` cursor.
+- Restart resumes from persisted cursor, not from zero.
+- Cursor write occurs after batch execution completes.
+- Recovery guarantees forward progress at batch granularity.
+
+## Reliability Engineering
+
+- Missing critical configuration fails at startup/runtime boundary.
+- Missing mapping keys raise explicit errors.
+- GraphQL API errors are surfaced and stop progression.
+- Checkpoint write timing preserves deterministic batch boundaries.
+
+## Scalability Considerations
+
+- Bounded-memory extraction via paged cursor traversal
+- Parallel I/O load path with controlled workers
+- Throughput constrained by Monday API limits, latency, and mutation cost
+- Current model is single-process, single-checkpoint-writer
+
+## Performance Optimization
+
+- Thread-based parallelism improves network-bound load throughput.
+- Configurable page limit controls extraction granularity.
+- Incremental progression reduces restart overhead for long migrations.
+
+## Tradeoffs & Constraints
+
+- Threaded concurrency chosen over async runtime complexity.
+- Fail-fast integrity favors correctness over best-effort completion.
+- Checkpoint file state favors simplicity over distributed scaling.
+- Current loader path uses create mutation flow and should evolve to explicit idempotent upsert semantics for strict replay safety.
+
+## Project Structure
+
+```text
+hubspot_to_monday_migration/
 ├── clients/
 │   ├── hubspot_client.py
 │   └── monday_client.py
-├── transformers/
-│   └── company_mapper.py
 ├── config/
 │   ├── settings.py
 │   ├── hubspot_columns.py
 │   └── monday_columns.py
 ├── state/
-│   └── checkpoint.py
+│   ├── checkpoint.py
+│   └── checkpoint.json
+├── transformers/
+│   └── company_mapper.py
+├── docs/
+├── diagrams/
 ├── main.py
-├── requirements.txt
+└── README.md
 ```
 
----
+## Setup Instructions
 
-## 🔐 Environment Variables
+1. Create and activate a Python virtual environment.
+2. Install dependencies.
+3. Configure `.env` with API credentials and runtime settings.
+4. Confirm Monday board columns match `config/monday_columns.py`.
 
-Create a `.env` file in the root directory:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+## Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `HUBSPOT_ACCESS_TOKEN` | Yes | HubSpot private app access token |
+| `HUBSPOT_PAGE_LIMIT` | No (default `100`) | HubSpot page size per extraction batch |
+| `MONDAY_API_TOKEN` | Yes | Monday API token |
+| `MONDAY_COMPANY_BOARD_ID` | Yes | Monday board destination identifier |
+
+Example:
 
 ```ini
-# HubSpot
-HUBSPOT_ACCESS_TOKEN=your_hubspot_private_app_token
+HUBSPOT_ACCESS_TOKEN=...
 HUBSPOT_PAGE_LIMIT=100
-
-# Monday
-MONDAY_API_TOKEN=your_monday_api_token
+MONDAY_API_TOKEN=...
 MONDAY_COMPANY_BOARD_ID=1234567890
 ```
 
----
+## Running the Pipeline
 
-## 🚀 Running the Migration
-
-To start the migration:
-
-```bash
+```powershell
 python main.py
 ```
 
-### Execution Flow
-1. Load configuration
-2. Load checkpoint cursor
-3. Fetch HubSpot records in batches
-4. Transform records
-5. Push to Monday.com (concurrently)
-6. Update checkpoint after successful batch
-7. Continue until dataset is exhausted
+Expected runtime behavior:
 
----
+- prints migration start cursor
+- processes batches until source exhaustion
+- writes checkpoint after each successful batch
+- emits summary with total processed and throughput
 
-## ⚡ Performance Characteristics
+## Recovery Behavior
 
-- Optimized for I/O-bound API workloads
-- Concurrency significantly improves throughput over sequential execution
-- Suitable for ~20k+ records depending on API latency and complexity limits
-- Worker count can be tuned based on Monday.com API constraints
-- **Example observed performance**: ~2–3 records per second with 6 workers (subject to API latency)
+- **Interruption before checkpoint write:** current batch may be replayed on restart.
+- **Interruption after checkpoint write:** next run resumes after committed cursor.
+- **Manual restart:** simply re-run `python main.py`.
+- **Fresh migration:** clear `state/checkpoint.json` cursor value.
 
----
+## Future Roadmap
 
-## 🛡️ Error Handling Strategy
+- idempotent upsert semantics for strict dedupe and replay safety
+- retry/backoff policy for transient API failures
+- centralized checkpoint state (Redis/Postgres)
+- orchestrated scheduling and run observability
+- DLQ + reconciliation reporting
 
-- API errors are surfaced immediately
-- Missing column mappings trigger hard failure
-- No silent column skipping
-- Checkpoint persists only after successful batch completion
-- **Correctness is prioritized over partial completion.**
+## Documentation Links
 
----
-
-## ⚠️ Limitations
-
-- Designed for one-time migration (not real-time sync)
-- No bulk mutation batching implemented
-- API rate limits and complexity constraints apply
-- Does not implement conflict reconciliation logic
-
----
-
-## 🔮 Potential Improvements
-
-- Bulk mutation batching (with controlled complexity)
-- Exponential backoff retry strategy
-- Structured logging
-- Support for additional HubSpot object types
-- Dry-run validation mode
+- [Architecture](docs/architecture.md)
+- [Checkpoint System](docs/checkpoint-system.md)
+- [Engineering Decisions (ADR)](docs/engineering-decisions.md)
+- [Scalability](docs/scalability.md)
+- [Reliability](docs/reliability.md)
+- [API Flow](docs/api-flow.md)
+- [Performance](docs/performance.md)
+- [Roadmap](docs/roadmap.md)
+- [Diagrams](diagrams/)
